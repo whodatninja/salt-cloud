@@ -27,6 +27,7 @@ import os
 import sys
 import stat
 import time
+import uuid
 import logging
 
 # Import saltcloud libs
@@ -274,9 +275,9 @@ def create(vm_):
         data = get_node(conn, vm_['name'])
         if data is None:
             failures += 1
-            if failures > 3:
-                log.error('Failed to get node data after 3 attempts')
-                return False
+            if failures > 10:
+                log.error('Failed to get node data after 10 attempts')
+                return {vm_['name']: False}
             log.info(
                 'Failed to get node data. Attempts: {0}'.format(
                     failures
@@ -305,7 +306,9 @@ def create(vm_):
     if 'sudo' in vm_.keys():
         sudo = vm_['sudo']
 
-    if __opts__['deploy'] is True:
+    ret = {}
+    deploy = vm_.get('deploy', __opts__.get('AWS.deploy', __opts__['deploy']))
+    if deploy is True:
         deploy_script = script(vm_)
         deploy_kwargs = {
             'host': ip_address,
@@ -332,11 +335,15 @@ def create(vm_):
 
         # Deploy salt-master files, if necessary
         if 'make_master' in vm_ and vm_['make_master'] is True:
+            deploy_kwargs['make_master'] = True
             deploy_kwargs['master_pub'] = vm_['master_pub']
             deploy_kwargs['master_pem'] = vm_['master_pem']
             master_conf = saltcloud.utils.master_conf_string(__opts__, vm_)
             if master_conf:
                 deploy_kwargs['master_conf'] = master_conf
+
+            if 'syndic_master' in master_conf:
+                deploy_kwargs['make_syndic'] = True
 
         if username == 'root':
             deploy_kwargs['deploy_command'] = '/tmp/deploy.sh'
@@ -344,13 +351,13 @@ def create(vm_):
         deployed = saltcloud.utils.deploy_script(**deploy_kwargs)
         if deployed:
             log.info('Salt installed on {name}'.format(**vm_))
+            ret['deploy_kwargs'] = deploy_kwargs
         else:
             log.error('Failed to start Salt on Cloud VM {name}'.format(**vm_))
 
     log.info(
         'Created Cloud VM {name} with the following values:'.format(**vm_)
     )
-    ret = {}
     for key, val in data.__dict__.items():
         ret[key] = val
         log.debug('  {0}: {1}'.format(key, val))
@@ -557,18 +564,31 @@ def destroy(name):
     '''
     ret = {}
 
+    newname = name
+    if 'AWS.rename_on_destroy' in __opts__:
+        if __opts__['AWS.rename_on_destroy'] is True:
+            newname = '{0}-DEL{1}'.format(name, uuid.uuid4().hex)
+            rename(name, kwargs={'newname': newname}, call='action')
+            log.info('Machine will be identified as {0} until it has been '
+                     'cleaned up by AWS.')
+
     from saltcloud.libcloudfuncs import destroy as libcloudfuncs_destroy
     location = get_location()
     conn = get_conn(location=location)
-    libcloudfuncs_destroy = namespaced_function(libcloudfuncs_destroy, globals(), (conn,))
+    libcloudfuncs_destroy = namespaced_function(
+        libcloudfuncs_destroy, globals(), (conn,)
+    )
     try:
-        result = libcloudfuncs_destroy(name, conn)
+        result = libcloudfuncs_destroy(newname, conn)
         ret[name] = result
     except Exception as e:
         if e.message.startswith('OperationNotPermitted'):
-            log.info('Failed: termination protection is enabled on {0}'.format(name))
+            log.info(
+                'Failed: termination protection is enabled on {0}'.format(
+                    name
+                )
+            )
         else:
             raise e
 
     return ret
-

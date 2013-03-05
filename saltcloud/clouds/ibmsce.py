@@ -128,7 +128,15 @@ def create(vm_):
             not_ready = False
         time.sleep(15)
 
-    if __opts__['deploy'] is True:
+    deploy = vm_.get(
+        'deploy',
+        __opts__.get(
+            'IBMSCE.deploy',
+            __opts__['deploy']
+        )
+    )
+    ret = {}
+    if deploy is True:
         deploy_script = script(vm_)
         log.debug(
             'Deploying {0} using IP address {1}'.format(
@@ -159,15 +167,28 @@ def create(vm_):
         deploy_kwargs['minion_conf'] = saltcloud.utils.minion_conf_string(
             __opts__, vm_
         )
+
+        # Deploy salt-master files, if necessary
+        if 'make_master' in vm_ and vm_['make_master'] is True:
+            deploy_kwargs['make_master'] = True
+            deploy_kwargs['master_pub'] = vm_['master_pub']
+            deploy_kwargs['master_pem'] = vm_['master_pem']
+            master_conf = saltcloud.utils.master_conf_string(__opts__, vm_)
+            if master_conf:
+                deploy_kwargs['master_conf'] = master_conf
+
+            if 'syndic_master' in master_conf:
+                deploy_kwargs['make_syndic'] = True
+
         deployed = saltcloud.utils.deploy_script(**deploy_kwargs)
         if deployed:
             log.info('Salt installed on {0}'.format(vm_['name']))
+            ret['deploy_kwargs'] = deploy_kwargs
         else:
             log.error(
                 'Failed to start Salt on Cloud VM {0}'.format(vm_['name'])
             )
 
-    ret = {}
     log.info(
         'Created Cloud VM {0} with the following values:'.format(vm_['name'])
     )

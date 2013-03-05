@@ -69,16 +69,16 @@ def get_conn():
     '''
     driver = get_driver(Provider.RACKSPACE)
     return driver(
-            __opts__['RACKSPACE.user'],
-            __opts__['RACKSPACE.apikey'],
-            )
+        __opts__['RACKSPACE.user'],
+        __opts__['RACKSPACE.apikey'],
+    )
 
 
 def preferred_ip(vm_, ips):
     '''
     Return the preferred Internet protocol. Either 'ipv4' (default) or 'ipv6'.
     '''
-    proto = vm_.get('protocol', __opts__.get('OPENSTACK.protocol', 'ipv4'))
+    proto = vm_.get('protocol', __opts__.get('RACKSPACE.protocol', 'ipv4'))
     family = socket.AF_INET
     if proto == 'ipv6':
         family = socket.AF_INET6
@@ -93,9 +93,16 @@ def preferred_ip(vm_, ips):
 
 def ssh_interface(vm_):
     '''
-    Return the ssh_interface type to connect to. Either 'public_ips' (default) or 'private_ips'.
+    Return the ssh_interface type to connect to. Either 'public_ips' (default)
+    or 'private_ips'.
     '''
-    return vm_.get('ssh_interface', __opts__.get('OPENSTACK.ssh_interface', 'public_ips'))
+    return vm_.get(
+        'ssh_interface',
+        __opts__.get(
+            'RACKSPACE.ssh_interface',
+            'public_ips'
+        )
+    )
 
 
 def create(vm_):
@@ -130,7 +137,8 @@ def create(vm_):
         running = nodelist[vm_['name']]['state'] == NodeState.RUNNING
 
         if running and private and not public:
-            log.warn('Private IPs returned, but not public... checking for misidentified IPs')
+            log.warn('Private IPs returned, but not public... checking for '
+                     'misidentified IPs')
             for private_ip in private:
                 private_ip = preferred_ip(vm_, [private_ip])
                 if saltcloud.utils.is_public_ip(private_ip):
@@ -163,7 +171,15 @@ def create(vm_):
     if not ip_address:
         raise
 
-    if __opts__['deploy'] is True:
+    deploy = vm_.get(
+        'deploy',
+        __opts__.get(
+            'RACKSPACE.deploy',
+            __opts__['deploy']
+        )
+    )
+    ret = {}
+    if deploy is True:
         deploy_script = script(vm_)
         deploy_kwargs = {
             'host': ip_address,
@@ -182,18 +198,41 @@ def create(vm_):
         if 'script_args' in vm_:
             deploy_kwargs['script_args'] = vm_['script_args']
 
-        deploy_kwargs['minion_conf'] = saltcloud.utils.minion_conf_string(__opts__, vm_)
+        deploy_kwargs['minion_conf'] = saltcloud.utils.minion_conf_string(
+            __opts__,
+            vm_
+        )
+
+        # Deploy salt-master files, if necessary
+        if 'make_master' in vm_ and vm_['make_master'] is True:
+            deploy_kwargs['make_master'] = True
+            deploy_kwargs['master_pub'] = vm_['master_pub']
+            deploy_kwargs['master_pem'] = vm_['master_pem']
+            master_conf = saltcloud.utils.master_conf_string(__opts__, vm_)
+            if master_conf:
+                deploy_kwargs['master_conf'] = master_conf
+
+            if 'syndic_master' in master_conf:
+                deploy_kwargs['make_syndic'] = True
+
         deployed = saltcloud.utils.deploy_script(**deploy_kwargs)
         if deployed:
             log.info('Salt installed on {0}'.format(vm_['name']))
+            ret['deploy_kwargs'] = deploy_kwargs
         else:
-            log.error('Failed to start Salt on Cloud VM {0}'.format(vm_['name']))
+            log.error(
+                'Failed to start Salt on Cloud VM {0}'.format(
+                    vm_['name']
+                )
+            )
 
-    ret = {}
-    log.info('Created Cloud VM {0} with the following values:'.format(vm_['name']))
+    log.info(
+        'Created Cloud VM {0} with the following values:'.format(
+            vm_['name']
+        )
+    )
     for key, val in data.__dict__.items():
         ret[key] = val
         log.info('  {0}: {1}'.format(key, val))
 
     return ret
-

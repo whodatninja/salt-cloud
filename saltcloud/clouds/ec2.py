@@ -25,6 +25,11 @@ set in the main cloud config:
     # driver for something other than Amazon EC2, change it here:
     EC2.service_url: amazonaws.com
 
+    # The endpoint that is ultimately used is usually formed using the region
+    # and the service_url. If you would like to override that entirely, you can
+    # explicitly define the endpoint:
+    EC2.endpoint: myendpoint.example.com:1138/services/Cloud
+
 '''
 
 # Import python libs
@@ -32,6 +37,7 @@ import os
 import sys
 import stat
 import time
+import uuid
 import logging
 
 # Import libs for talking to the EC2 API
@@ -70,6 +76,7 @@ size_map = {
     'Cluster Compute Quadruple Extra Large Instance': 'cc1.4xlarge',
     'Cluster Compute Eight Extra Large Instance': 'cc2.8xlarge',
 }
+
 
 # Only load in this module if the EC2 configurations are in place
 def __virtual__():
@@ -130,7 +137,7 @@ if hasattr(Provider, 'EC2_AP_SOUTHEAST2'):
 
 
 def _xml_to_dict(xmltree):
-    ''' 
+    '''
     Convert an XML tree into a dict
     '''
     if len(xmltree.getchildren()) < 1:
@@ -173,7 +180,12 @@ def query(params=None, setname=None, requesturl=None, return_url=False,
     if not requesturl:
         location = get_location()
         method = 'GET'
-        endpoint = 'ec2.{0}.{1}'.format(location, service_url)
+
+        if 'EC2.endpoint' in __opts__:
+            endpoint = __opts__['EC2.endpoint']
+        else:
+            endpoint = 'ec2.{0}.{1}'.format(location, service_url)
+
         params['AWSAccessKeyId'] = '{0}'.format(keyid)
         params['SignatureVersion'] = '2'
         params['SignatureMethod'] = 'HmacSHA256'
@@ -181,7 +193,7 @@ def query(params=None, setname=None, requesturl=None, return_url=False,
         params['Version'] = '2010-08-31'
         keys = sorted(params.keys())
         values = map(params.get, keys)
-        querystring = urllib.urlencode( list(zip(keys,values)) )
+        querystring = urllib.urlencode(list(zip(keys, values)))
 
         uri = '{0}\n{1}\n/\n{2}'.format(method.encode('utf-8'),
                                         endpoint.encode('utf-8'),
@@ -195,9 +207,17 @@ def query(params=None, setname=None, requesturl=None, return_url=False,
         requesturl = 'https://{0}/?{1}'.format(endpoint, querystring)
 
     log.debug('EC2 Request: {0}'.format(requesturl))
-    result = urllib2.urlopen(requesturl)
+    try:
+        result = urllib2.urlopen(requesturl)
+        log.debug('EC2 Response Status Code: {0}'.format(result.getcode()))
+    except urllib2.URLError as exc:
+        log.error('EC2 Response Status Code: {0} {1}'.format(exc.code,
+                                                             exc.msg))
+        root = ET.fromstring(exc.read())
+        log.error(_xml_to_dict(root))
+        return {'error': _xml_to_dict(root)}
+
     response = result.read()
-    log.debug('EC2 Response Status Code: {0}'.format(result.getcode()))
     result.close()
 
     root = ET.fromstring(response)
@@ -232,19 +252,22 @@ def avail_sizes():
         'Cluster Compute': {
             'cc2.8xlarge': {
                 'id': 'cc2.8xlarge',
-                'cores': '16 (2 x Intel Xeon E5-2670, eight-core with hyperthread)',
+                'cores': '16 (2 x Intel Xeon E5-2670, eight-core with '
+                         'hyperthread)',
                 'disk': '3360 GiB (4 x 840 GiB)',
                 'ram': '60.5 GiB'},
             'cc1.4xlarge': {
                 'id': 'cc1.4xlarge',
-                'cores': '8 (2 x Intel Xeon X5570, quad-core with hyperthread)',
+                'cores': '8 (2 x Intel Xeon X5570, quad-core with '
+                         'hyperthread)',
                 'disk': '1690 GiB (2 x 840 GiB)',
                 'ram': '22.5 GiB'},
             },
         'Cluster CPU': {
             'cg1.4xlarge': {
                 'id': 'cg1.4xlarge',
-                'cores': '8 (2 x Intel Xeon X5570, quad-core with hyperthread), plus 2 NVIDIA Tesla M2050 GPUs',
+                'cores': '8 (2 x Intel Xeon X5570, quad-core with '
+                         'hyperthread), plus 2 NVIDIA Tesla M2050 GPUs',
                 'disk': '1680 GiB (2 x 840 GiB)',
                 'ram': '22.5 GiB'},
             },
@@ -515,7 +538,6 @@ def get_availability_zone(vm_):
     return avz
 
 
-
 def list_availability_zones():
     '''
     List all availability zones in the current region
@@ -565,18 +587,26 @@ def create(vm_=None, call=None):
 
     params['Placement.AvailabilityZone'] = get_availability_zone(vm_)
 
-    if 'delvol_on_destroy' in vm_:
-        value = vm_['delvol_on_destroy']
-        if value is True:
-            value = 'true'
-        elif value is False:
-            value = 'false'
+    delvol_on_destroy = vm_.get(
+        'delvol_on_destroy',            # Grab the value from the VM config
+        __opts__.get(
+            'EC2.delvol_on_destroy',    # If not available, try from the
+            None                        # provider config defaulting to None
+        )
+    )
+    if delvol_on_destroy is not None:
+        if not isinstance(delvol_on_destroy, bool):
+            raise ValueError('\'delvol_on_destroy\' should be a boolean value')
 
         params['BlockDeviceMapping.1.DeviceName'] = '/dev/sda1'
-        params['BlockDeviceMapping.1.Ebs.DeleteOnTermination'] = value
+        params['BlockDeviceMapping.1.Ebs.DeleteOnTermination'] = str(
+            delvol_on_destroy
+        ).lower()
 
     try:
         data = query(params, 'instancesSet')
+        if 'error' in data:
+            return data['error']
     except Exception as exc:
         err = (
             'Error creating {0} on EC2 when trying to '
@@ -619,7 +649,9 @@ def create(vm_=None, call=None):
     if 'sudo' in vm_.keys():
         sudo = vm_['sudo']
 
-    if __opts__['deploy'] is True:
+    ret = {}
+    deploy = vm_.get('deploy', __opts__.get('EC2.deploy', __opts__['deploy']))
+    if deploy is True:
         deploy_script = script(vm_)
         deploy_kwargs = {
             'host': ip_address,
@@ -649,11 +681,15 @@ def create(vm_=None, call=None):
 
         # Deploy salt-master files, if necessary
         if 'make_master' in vm_ and vm_['make_master'] is True:
+            deploy_kwargs['make_master'] = True
             deploy_kwargs['master_pub'] = vm_['master_pub']
             deploy_kwargs['master_pem'] = vm_['master_pem']
             master_conf = saltcloud.utils.master_conf_string(__opts__, vm_)
             if master_conf:
                 deploy_kwargs['master_conf'] = master_conf
+
+            if 'syndic_master' in master_conf:
+                deploy_kwargs['make_syndic'] = True
 
         if username == 'root':
             deploy_kwargs['deploy_command'] = '/tmp/deploy.sh'
@@ -661,13 +697,14 @@ def create(vm_=None, call=None):
         deployed = saltcloud.utils.deploy_script(**deploy_kwargs)
         if deployed:
             log.info('Salt installed on {name}'.format(**vm_))
+            ret['deploy_kwargs'] = deploy_kwargs
         else:
             log.error('Failed to start Salt on Cloud VM {name}'.format(**vm_))
 
     log.info(
         'Created Cloud VM {name} with the following values:'.format(**vm_)
     )
-    ret = (data[0]['instancesSet']['item'])
+    ret.update(data[0]['instancesSet']['item'])
 
     volumes = vm_.get('map_volumes')
     if volumes:
@@ -833,7 +870,7 @@ def rename(name, kwargs, call=None):
     instances = list_nodes_full()
     instance_id = instances[name]['instanceId']
 
-    set_tags(name, {'Name': kwargs['newname']})
+    set_tags(name, {'Name': kwargs['newname']}, call='action')
     saltcloud.utils.rename_key(
         __opts__['pki_dir'], name, kwargs['newname']
     )
@@ -855,8 +892,15 @@ def destroy(name, call=None):
     if protected == 'true':
         log.error('This instance has been protected from being destroyed. '
                   'Use the following command to disable protection:\n\n'
-                  'salt-cloud -a disable_term_protect {0}'.format(name)) 
+                  'salt-cloud -a disable_term_protect {0}'.format(name))
         exit(1)
+
+    if 'EC2.rename_on_destroy' in __opts__:
+        if __opts__['EC2.rename_on_destroy'] is True:
+            newname = '{0}-DEL{1}'.format(name, uuid.uuid4().hex)
+            rename(name, kwargs={'newname': newname}, call='action')
+            log.info('Machine will be identified as {0} until it has been '
+                     'cleaned up.')
 
     params = {'Action': 'TerminateInstances',
               'InstanceId.1': instance_id}
@@ -890,7 +934,9 @@ def show_image(kwargs, call=None):
     Show the details from EC2 concerning an AMI
     '''
     if call != 'function':
-        log.error('The show_image function must be called with -f or --function.')
+        log.error(
+            'The show_image function must be called with -f or --function.'
+        )
         sys.exit(1)
 
     params = {'ImageId.1': kwargs['image'],
@@ -906,7 +952,9 @@ def show_instance(name, call=None):
     Show the details from EC2 concerning an AMI
     '''
     if call != 'action':
-        log.error('The show_instance action must be called with -a or --action.')
+        log.error(
+            'The show_instance action must be called with -a or --action.'
+        )
         sys.exit(1)
 
     nodes = list_nodes_full()
@@ -931,20 +979,24 @@ def list_nodes_full():
                     if tag['key'] == 'Name':
                         name = tag['value']
             else:
-                name = instance['instancesSet']['item']['tagSet']['item']['value']
+                name = (
+                   instance['instancesSet']['item']['tagSet']['item']['value'])
         else:
             name = instance['instancesSet']['item']['instanceId']
         ret[name] = instance['instancesSet']['item']
         ret[name]['id'] = instance['instancesSet']['item']['instanceId'],
         ret[name]['image'] = instance['instancesSet']['item']['imageId'],
         ret[name]['size'] = instance['instancesSet']['item']['instanceType'],
-        ret[name]['state'] = instance['instancesSet']['item']['instanceState']['name']
+        ret[name]['state'] = (
+                    instance['instancesSet']['item']['instanceState']['name'])
         ret[name]['private_ips'] = []
         ret[name]['public_ips'] = []
         if 'privateIpAddress' in instance['instancesSet']['item']:
-            ret[name]['private_ips'].append(instance['instancesSet']['item']['privateIpAddress'])
+            ret[name]['private_ips'].append(
+                        instance['instancesSet']['item']['privateIpAddress'])
         if 'ipAddress' in instance['instancesSet']['item']:
-            ret[name]['public_ips'].append(instance['instancesSet']['item']['ipAddress'])
+            ret[name]['public_ips'].append(
+                        instance['instancesSet']['item']['ipAddress'])
 
     return ret
 
@@ -1333,4 +1385,3 @@ def delete_keypair(kwargs=None, call=None):
 
     data = query(params, return_root=True)
     return data
-

@@ -139,6 +139,16 @@ class Cloud(object):
             sizes[prov] = self.clouds[fun]()
         return sizes
 
+    def provider_list(self, lookup='all'):
+        '''
+        Return a mapping of all image data for available providers
+        '''
+        provs = self.get_providers()
+        prov_list = {}
+        for prov in provs:
+            prov_list[prov] = {}
+        return prov_list
+
     def create_all(self):
         '''
         Create/Verify the VMs in the VM data
@@ -339,7 +349,7 @@ class Cloud(object):
 
         return ret
 
-    def do_function(self, prov, func, kwargs):
+    def do_function(self, func, prov, kwargs):
         '''
         Perform a function against a cloud provider
         '''
@@ -472,31 +482,79 @@ class Map(Cloud):
         Execute the contents of the VM map
         '''
         output = {}
+        if self.opts['parallel']:
+            parallel_data = []
+        master_name = None
+        master_host = None
+        try:
+            master_name, master_profile = ((name, profile) for name, profile in
+                dmap['create'].items() if 'make_master' in profile and
+                profile['make_master'] is True).next()
+            log.debug('Creating new master {0}'.format(master_name))
+            tvm = self.vm_options(master_name, master_profile, None, ['grains', 'volumes'])
+            out = self.create(tvm)
+            if 'deploy_kwargs' in out and 'host' in out['deploy_kwargs']:
+                master_host = out['deploy_kwargs']['host']
+                output[master_name] = out
+            else:
+                print('Host for new master {0} was not found, '
+                    'aborting map'.format(master_name))
+                sys.exit(1)
+        except StopIteration:
+            log.debug('No make_master found in map')
+
         # Generate the fingerprint of the master pubkey in
         #     order to mitigate man-in-the-middle attacks
         master_pub = self.opts['pki_dir'] + '/master.pub'
         master_finger = ''
         if os.path.isfile(master_pub) and hasattr(salt.utils, 'pem_finger'):
             master_finger = salt.utils.pem_finger(master_pub)
+
+        option_types = ['grains', 'minion', 'volumes']
         for name, profile in dmap['create'].items():
-            tvm = copy.deepcopy(profile)
-            tvm['name'] = name
-            tvm['master_finger'] = master_finger
-            for miniondict in self.map[tvm['profile']]:
-                if isinstance(miniondict, dict):
-                    if name in miniondict:
-                        if 'grains' in miniondict[name]:
-                            tvm['map_grains'] = miniondict[name]['grains']
-                        if 'minion' in miniondict[name]:
-                            tvm['map_minion'] = miniondict[name]['minion']
-                        if 'volumes' in miniondict[name]:
-                            tvm['map_volumes'] = miniondict[name]['volumes']
+            if master_name and name is master_name:
+                continue
+            if 'minion' not in profile:
+                profile['minion'] = {}
+            if master_host and 'master' not in profile['minion']:
+                profile['minion']['master'] = master_host
+            tvm = self.vm_options(name, profile, master_finger, option_types)
             if self.opts['parallel']:
-                multiprocessing.Process(
-                    target=lambda: self.create(tvm)
-                ).start()
+                parallel_data.append({
+                    'opts': self.opts,
+                    'name': name,
+                    'profile': tvm,
+                })
             else:
                 output[name] = self.create(tvm)
         for name in dmap.get('destroy', set()):
             output[name] = self.destroy(name)
+        if self.opts['parallel'] and len(parallel_data) > 0:
+            output_multip = multiprocessing.Pool(len(parallel_data)).map(
+                func=create_multiprocessing,
+                iterable=parallel_data
+            )
+            for obj in output_multip:
+                output.update(obj)
         return output
+
+    def vm_options(self, name, profile, master_finger, option_types):
+        tvm = copy.deepcopy(profile)
+        tvm['name'] = name
+        tvm['master_finger'] = master_finger
+        for miniondict in self.map[tvm['profile']]:
+            if isinstance(miniondict, dict) and name in miniondict:
+                for option in option_types:
+                    tvm['map_{0}'.format(option)] = miniondict[name][option]
+        return tvm
+
+
+def create_multiprocessing(config):
+    """
+    This function will be called from another process when running a map in
+    parallel mode. The result from the create is always a json object.
+    """
+    config['opts']['output'] = 'json'
+    cloud = Cloud(config['opts'])
+    output = cloud.create(config['profile'])
+    return {config['name']: output}

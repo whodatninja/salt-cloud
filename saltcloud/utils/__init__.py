@@ -152,7 +152,7 @@ def minion_conf_string(opts, vm_):
         minion['master_finger'] = vm_['master_finger']
     minion.update(opts.get('minion', {}))
     minion.update(vm_.get('minion', {}))
-    if 'master' not in minion:
+    if 'master' not in minion and 'make_master' not in vm_:
         raise ValueError("A master was not defined.")
     minion.update(opts.get('map_minion', {}))
     minion.update(vm_.get('map_minion', {}))
@@ -258,7 +258,7 @@ def deploy_script(host, port=22, timeout=900, username='root',
                   master_pub=None, master_pem=None, master_conf=None,
                   minion_pub=None, minion_pem=None, minion_conf=None,
                   keep_tmp=False, script_args=None, ssh_timeout=15,
-                  display_ssh_output=True):
+                  display_ssh_output=True, make_syndic=False):
     '''
     Copy a deploy script to a remote server, execute it, and remove it
     '''
@@ -342,8 +342,10 @@ def deploy_script(host, port=22, timeout=900, username='root',
             # Run the deploy script
             if script:
                 log.debug('Executing /tmp/deploy.sh')
+                if make_syndic:
+                    deploy_command += ' -S'
                 if make_master:
-                    deploy_command += ' -m'
+                    deploy_command += ' -M'
                 if 'bootstrap-salt' in script:
                     deploy_command += ' -c /tmp/'
                 if script_args:
@@ -452,7 +454,7 @@ def root_cmd(command, tty, sudo, **kwargs):
     '''
     if sudo:
         command = 'sudo ' + command
-        log.debug('Using sudo to run command')
+        log.debug('Using sudo to run command {0}'.format(command))
 
     ssh_args = ' -oStrictHostKeyChecking=no'
     ssh_args += ' -oUserKnownHostsFile=/dev/null'
